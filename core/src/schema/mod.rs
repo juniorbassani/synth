@@ -67,6 +67,7 @@ pub fn bool_from_str<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<boo
         .map_err(|e| D::Error::custom(format!("not a boolean: {}", e)))
 }
 
+#[bindlang::bindlang]
 #[derive(Hash, PartialEq, Eq, Debug, Clone, Ord, PartialOrd)]
 pub struct Name(String);
 

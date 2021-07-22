@@ -52,7 +52,6 @@ impl FromIterator<(Name, Content)> for Namespace {
     }
 }
 
-//TODO #[bindlang::bindlang]
 impl Namespace {
     #[cfg(test)]
     pub fn accepts(&self, name: &Name, value: &Value) -> Result<()> {

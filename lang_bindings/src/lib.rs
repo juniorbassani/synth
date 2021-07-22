@@ -1,15 +1,14 @@
 /// bindings for our koto-derived language
 ///
 /// for now we use koto wholesale, will add custom syntax later
-
 // re-export Value for derive macro
 pub use koto::runtime::Value;
-use koto::runtime::{ValueNumber, RuntimeError, runtime_error};
+use koto::runtime::{runtime_error, RuntimeError, ValueNumber};
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::fmt::{Display, Formatter};
 use std::error::Error;
+use std::fmt::{Display, Formatter};
 
 pub enum KeyPath<'parent> {
     Index(usize, Option<&'parent KeyPath<'parent>>),
@@ -42,19 +41,18 @@ pub trait FromValue: Sized {
 }
 
 #[cold]
-pub fn fn_type_error<T: Sized>(fn_name: &str, inputs: &str, args: &[Value]) -> Result<T, RuntimeError> {
+pub fn fn_type_error<T: Sized>(
+    fn_name: &str,
+    inputs: &str,
+    args: &[Value],
+) -> Result<T, RuntimeError> {
     let mut types = args.iter().map(|v| v.type_as_string());
     let mut argspec = types.next().unwrap_or_else(String::new);
     for ty in types {
         argspec += ", ";
         argspec += &ty;
     }
-    runtime_error!(
-        "expected {}({:?}), got {}",
-        fn_name,
-        inputs,
-        argspec,
-    )
+    runtime_error!("expected {}({:?}), got {}", fn_name, inputs, argspec,)
 }
 
 /// Return an error for a missing item
@@ -65,7 +63,11 @@ pub fn missing<T: Sized>(key_path: &KeyPath<'_>) -> Result<T, RuntimeError> {
 
 /// Return an error for an item of the wrong type
 #[cold]
-fn wrong_type<T: Sized>(ty: &'static str, key_path: &KeyPath<'_>, value: &Value) -> Result<T, RuntimeError> {
+fn wrong_type<T: Sized>(
+    ty: &'static str,
+    key_path: &KeyPath<'_>,
+    value: &Value,
+) -> Result<T, RuntimeError> {
     runtime_error!(
         "expected value of type {} at {}, found {}",
         ty,
@@ -101,7 +103,20 @@ macro_rules! impl_from_value_num {
     }
 }
 
-impl_from_value_num!("integer", ValueNumber::I64, u8, u16, u32, u64, usize, i8, i16, i32, i64, isize);
+impl_from_value_num!(
+    "integer",
+    ValueNumber::I64,
+    u8,
+    u16,
+    u32,
+    u64,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    isize
+);
 impl_from_value_num!("float", ValueNumber::F64, f32, f64);
 
 impl FromValue for String {
@@ -124,7 +139,8 @@ impl<T: FromValue> FromValue for Vec<T> {
                 .map(|(i, v)| {
                     let item = T::from_value(&KeyPath::Index(i, Some(key_path)), v);
                     item
-                }).collect()
+                })
+                .collect()
         } else {
             wrong_type("list of items", key_path, value)
         }
@@ -134,15 +150,14 @@ impl<T: FromValue> FromValue for Vec<T> {
 impl<K: FromValue + PartialOrd + Ord, V: FromValue> FromValue for BTreeMap<K, V> {
     fn from_value(key_path: &KeyPath<'_>, value: &Value) -> Result<Self, RuntimeError> {
         if let Value::Map(map) = value {
-            map
-                .contents()
+            map.contents()
                 .data
                 .iter()
                 .map(|(k, v)| {
                     let kval = k.value();
                     Ok((
                         K::from_value(key_path, kval)?,
-                        V::from_value(&KeyPath::Field(kval.to_string().into(), Some(key_path)), v)?
+                        V::from_value(&KeyPath::Field(kval.to_string().into(), Some(key_path)), v)?,
                     ))
                 })
                 .collect()
@@ -152,15 +167,38 @@ impl<K: FromValue + PartialOrd + Ord, V: FromValue> FromValue for BTreeMap<K, V>
     }
 }
 
+impl<T: FromValue, E: Sized> FromValue for Result<T, E> {
+    fn from_value(key_path: &KeyPath<'_>, value: &Value) -> Result<Self, RuntimeError> {
+        T::from_value(&KeyPath::Field(Cow::Borrowed("ok"), Some(key_path)), value).map(Ok)
+    }
+}
+
 impl<T, E> IntoValue for Result<T, E>
-    where T: IntoValue,
-          E: Error
+where
+    T: IntoValue,
+    E: Error,
 {
     fn into_value(self) -> ValueResult {
         match self {
             Ok(ok) => ok.into_value(),
-            Err(e) => runtime_error!("{}", e)
+            Err(e) => runtime_error!("{}", e),
         }
+    }
+}
+
+impl<T: FromValue> FromValue for Option<T> {
+    fn from_value(key_path: &KeyPath<'_>, value: &Value) -> Result<Self, RuntimeError> {
+        if let &Value::Empty = value {
+            Ok(None)
+        } else {
+            T::from_value(key_path, value).map(Some)
+        }
+    }
+}
+
+impl<T: IntoValue> IntoValue for Option<T> {
+    fn into_value(self) -> ValueResult {
+        self.map_or(Ok(Value::Empty), IntoValue::into_value)
     }
 }
 

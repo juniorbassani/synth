@@ -13,56 +13,201 @@ fn ident(s: &str) -> Ident {
     syn::parse_str(s).unwrap()
 }
 
-/// all we need to wrap a method
+#[derive(Debug)]
+enum MethodArgs {
+    /// unit constructors (e.g. `MyStruct`, `My)Enum::UnitVariant`
+    Unit,
+    /// function call or tuple struct / variant, `self_ty` contains the self type for method calls
+    Tuple {
+        args: usize,
+        self_ty: Option<String>,
+    },
+    /// named arguments, in given order
+    Named { names: Vec<String> },
+}
+
+/// all we need to wrap a method or constructor
+#[derive(Debug)]
 struct MethodSig {
-    name: String,
-    args: usize,
+    /// This is the name on the Rust side of things (which may be different from koto's name, e.g.
+    /// `MyEnum::MyVariant` or `<MyType as MyTrait>::my_function`)
+    path: String,
+    /// The arguments. There are 3 variants: Unit for unit structs/variants, Tuple for functions
+    /// and tuple structs/variants and Named for named structs/variants
+    args: MethodArgs,
+    /// a stringified representation of the required arguments for error reporting
     inputs: String,
-    self_ty: Option<(String, Option<String>)>,
+}
+
+fn is_public(vis: &Visibility) -> bool {
+    matches!(vis, Visibility::Public(_))
+}
+
+fn is_field_public(field: &Field) -> bool {
+    is_public(&field.vis)
 }
 
 impl MethodSig {
-    // create a tuple expr of (call, is_method)
-    fn to_tuple(&self) -> Expr {
-        let fn_name = &self.name;
-        let fn_ident = ident(&self.name);
-        let inputs = &self.inputs;
-        let names: Vec<_> = (0..self.args).map(|i| ident(&format!("a{}", i))).collect();
-        let mut exprs = names.iter().enumerate().map(|(i, name)| {
-            parse_quote! {
-                ::lang_bindings::FromValue::from_value(&::lang_bindings::KeyPath::Index(#i, None), #name)?
-            }
-        });
-        let (call, is_method): (Expr, bool) = if let Some((ty, trait_ty)) = &self.self_ty {
-            let ty_ident = ident(ty);
-            if self.args > 0 {
-                let a0: &Ident = &names[0];
-                let _: Expr = exprs.next().unwrap();
-                (
-                    parse_quote! {
-                        <#ty_ident as ::lang_bindings::FromValue>::from_value(&::lang_bindings::KeyPath::Index(0, None), #a0)?. #fn_ident(#(#exprs),*)
-                    },
-                    true,
-                )
-            } else if let Some(trait_ty) = trait_ty {
-                let trait_ty: Type = parse_str(trait_ty).unwrap();
-                (parse_quote! { <#ty_ident as #trait_ty>::#fn_ident() }, false)
-            } else {
-                (parse_quote! { #ty_ident :: #fn_ident() }, false)
-            }
-        } else {
-            (parse_quote! { #fn_ident(#(#exprs),*) }, false)
-        };
-        parse_quote! {
-            (
-                #fn_name,
-                ::koto_runtime::ExternalFunction::new(|vm, args| {
-                    match vm.get_args(args) {
-                        [#(#names),*] => ::lang_bindings::IntoValue::into_value(#call),
-                        args => ::lang_bindings::fn_type_error(#fn_name, #inputs, args),
+    fn from_fields(path: String, fields: &Fields) -> Option<Self> {
+        let result = Some(MethodSig {
+            inputs: path.clone(), //TODO: improve this
+            path,
+            args: match fields {
+                Fields::Named(FieldsNamed { named, .. }) => {
+                    if named.iter().all(is_field_public) {
+                        MethodArgs::Named {
+                            names: named
+                                .iter()
+                                .map(|f| f.ident.as_ref().unwrap().to_string())
+                                .collect(),
+                        }
+                    } else {
+                        return None;
                     }
-                }, #is_method),
-            )
+                }
+                Fields::Unnamed(FieldsUnnamed { unnamed, .. }) => {
+                    if unnamed.iter().all(is_field_public) {
+                        MethodArgs::Tuple {
+                            args: unnamed.len(),
+                            self_ty: None,
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+                Fields::Unit => MethodArgs::Unit,
+            },
+        });
+        result
+    }
+
+    fn from_sig(sig: &Signature, item_impl: Option<&ItemImpl>) -> Self {
+        let args = MethodArgs::Tuple {
+            args: sig.inputs.len(),
+            self_ty: sig.receiver().and_then(|_| {
+                item_impl.map(|i| {
+                    let ty = &*i.self_ty;
+                    (quote! { #ty }).to_string()
+                })
+            }),
+        };
+        let fn_ident = &sig.ident;
+        let path = match &item_impl {
+            Some(_) if sig.receiver().is_some() => quote! { #fn_ident },
+            Some(&ItemImpl {
+                ref self_ty,
+                trait_: Some((_, ref trait_ty, _)),
+                ..
+            }) => quote! { <#self_ty as #trait_ty>::#fn_ident },
+            Some(&ItemImpl {
+                ref self_ty,
+                trait_: None,
+                ..
+            }) => quote! { #self_ty::#fn_ident },
+            None => quote! { #fn_ident },
+        }
+        .to_string();
+        MethodSig {
+            path,
+            args,
+            inputs: (quote! { #sig }).to_string(),
+        }
+    }
+
+    // create a tuple expr of (call, is_method)
+    //
+    // variants:
+    // * named struct / enum variant
+    // * unit struct / enum variant
+    // * tuple struct / enum variant
+    // * plain function call / plain trait function call
+    // * method call
+
+    fn to_tuple(&self, koto_name: &str) -> Expr {
+        let path: Expr = parse_str(&self.path).unwrap();
+        match &self.args {
+            MethodArgs::Tuple { args, self_ty } => {
+                let is_method = self_ty.is_some();
+                let inputs = &self.inputs;
+                let idents: Vec<_> = (0..*args).map(|i| ident(&format!("a{}", i))).collect();
+                let mut exprs = idents.iter().enumerate().map(|(i, name)| {
+                    parse_quote! {
+                        ::lang_bindings::FromValue::from_value(
+                            &::lang_bindings::KeyPath::Index(#i, None),
+                            #name
+                        )?
+                    }
+                });
+                // this should be OK bectause if lets are evaluated left to right
+                if let Some(ref self_ty) = self_ty {
+                    let first: Option<Expr> = exprs.next();
+                    if first.is_some() {
+                        let a0 = &idents[0];
+                        let ty: Type = parse_str(self_ty).unwrap();
+                        return parse_quote! {
+                            (
+                                #koto_name,
+                                ::koto_runtime::ExternalFunction::new(
+                                    |vm, args| match vm.get_args(args) {
+                                        [#(#idents),*] => ::lang_bindings::IntoValue::into_value(
+                                            <#ty as ::lang_bindings::FromValue>::from_value(
+                                                &::lang_bindings::KeyPath::Index(0, None),
+                                                #a0
+                                            )?.#path(#(#exprs),*)),
+                                        args => ::lang_bindings::fn_type_error(
+                                            #koto_name,
+                                            #inputs,
+                                            args
+                                        ),
+                                    }, #is_method)
+                            )
+                        }
+                    }
+                }
+                parse_quote! {
+                    (
+                        #koto_name,
+                        ::koto_runtime::ExternalFunction::new(|vm, args| match vm.get_args(args) {
+                            [#(#idents),*] => ::lang_bindings::IntoValue::into_value(#path(#(#exprs),*)),
+                            args => ::lang_bindings::fn_type_error(#koto_name, #inputs, args),
+                        }, #is_method)
+                    )
+                }
+            }
+            MethodArgs::Named { names } => {
+                let idents: Vec<_> = names.iter().map(|n| ident(n)).collect();
+                let inputs = names.join(", ");
+                parse_quote! {
+                    (
+                        #koto_name,
+                        ::koto_runtime::ExternalFunction::new(|vm, args| {
+                            match vm.get_args(args) {
+                                [#(#idents),*] => ::lang_bindings::IntoValue::into_value(#path {
+                                    #(#idents: ::lang_bindings::FromValue::from_value(
+                                        &::lang_bindings::KeyPath::Field(
+                                            std::borrow::Cow::Borrowed(stringify!(#idents)),
+                                            None
+                                        ),
+                                        #idents
+                                    )?),*
+                                }),
+                                args => ::lang_bindings::fn_type_error(#koto_name, #inputs, args),
+                            }
+                        }, false)
+                    )
+                }
+            }
+            MethodArgs::Unit => parse_quote! {
+                (
+                    #koto_name,
+                    ::koto_runtime::ExternalFunction::new(|vm, args| {
+                        match vm.get_args(args) {
+                            [] => ::lang_bindings::IntoValue::into_value(#path),
+                            args => ::lang_bindings::fn_type_error(#koto_name, "()", args),
+                        }
+                    }, false)
+                )
+            },
         }
     }
 }
@@ -70,9 +215,9 @@ impl MethodSig {
 // We need some structures to keep stuff around
 #[derive(Default)]
 struct Context {
-    bare_fns: Vec<MethodSig>,
-    modules: HashMap<String, Vec<MethodSig>>,
-    vtables: HashMap<String, Vec<MethodSig>>,
+    bare_fns: HashMap<String, MethodSig>,
+    modules: HashMap<String, HashMap<String, MethodSig>>,
+    vtables: HashMap<String, HashMap<String, MethodSig>>,
     types: HashMap<String, String>,
 }
 
@@ -80,30 +225,30 @@ lazy_static::lazy_static! {
     static ref CONTEXT: Arc<Mutex<Context>> = Arc::new(Mutex::new(Context::default()));
 }
 
-fn fn_binding(sig: &Signature, module: Option<String>, self_ty: Option<&Type>, trait_ty: Option<String>) {
+fn bind_sig(sig: &Signature, module: Option<String>, item_impl: Option<&ItemImpl>) {
+    let ctx = &mut CONTEXT.lock().unwrap();
     let fn_ident = &sig.ident;
-    let inputs = &sig.inputs;
-    let method_sig = MethodSig {
-        name: fn_ident.to_string(),
-        args: inputs.len(),
-        inputs: quote!(#inputs).to_string(),
-        self_ty: self_ty.map(|ty| (quote!(#ty).to_string(), trait_ty)),
-    };
-    let ctx = &mut *CONTEXT.lock().unwrap();
-    if self_ty.is_some() {
+    if let Some(i) = item_impl {
+        let self_ty = &*i.self_ty;
+        let self_ty_str = quote! { #self_ty }.to_string();
         if sig.receiver().is_some() {
             &mut ctx.vtables
         } else {
             &mut ctx.modules
         }
-        .entry(method_sig.self_ty.as_ref().map(|(s, _)| s.clone()).unwrap())
-        .or_insert_with(Vec::new)
-    } else if let Some(m) = module {
-        ctx.modules.entry(m).or_insert_with(Vec::new)
+        .entry(self_ty_str)
+        .or_insert_with(HashMap::new)
+        .insert(fn_ident.to_string(), MethodSig::from_sig(sig, item_impl));
     } else {
-        &mut ctx.bare_fns
+        let mut module_entry;
+        if let Some(m) = module {
+            module_entry = ctx.modules.entry(m).or_insert_with(HashMap::new);
+            &mut module_entry
+        } else {
+            &mut ctx.bare_fns
+        }
+        .insert(fn_ident.to_string(), MethodSig::from_sig(sig, None));
     }
-    .push(method_sig)
 }
 
 fn get_attr_parens(attr: &Attribute) -> String {
@@ -123,6 +268,7 @@ fn get_module(attrs: &[Attribute]) -> Option<String> {
     })
 }
 
+// derive, (name, args)
 static DERIVES: &[(&str, (&str, usize))] = &[
     ("Default", ("default", 0)),
     ("Clone", ("clone", 1)),
@@ -137,27 +283,41 @@ fn get_derives(ty: String, attrs: &[Attribute]) {
                 let derive = derive.trim_matches(char::is_whitespace);
                 for (trt, (name, args)) in DERIVES {
                     if trt == &derive {
+                        let name = *name;
                         let args = *args;
+                        let path = format!("<{} as {}>::{}", ty, trt, name);
                         let ctx = &mut CONTEXT.lock().unwrap();
                         if args == 0 {
                             ctx.modules
                                 .entry(ty.clone())
-                                .or_insert_with(Vec::new)
-                                .push(MethodSig {
-                                    name: name.to_string(),
-                                    args,
-                                    inputs: String::new(),
-                                    self_ty: Some((ty.clone(), Some(trt.to_string()))),
-                                })
+                                .or_insert_with(HashMap::new)
+                                .insert(
+                                    name.to_owned(),
+                                    MethodSig {
+                                        path,
+                                        args: MethodArgs::Tuple {
+                                            args: 0,
+                                            self_ty: None,
+                                        },
+                                        inputs: String::new(),
+                                    },
+                                );
                         } else {
-                            ctx.vtables.entry(ty.clone()).or_insert_with(Vec::new).push(
-                                MethodSig {
-                                    name: name.to_string(),
-                                    args,
-                                    inputs: "self".to_string(), //TODO: add to DERIVES if we add traits w/ more args
-                                    self_ty: Some((ty.clone(), Some(trt.to_string()))),
-                                },
-                            );
+                            ctx.vtables
+                                .entry(ty.clone())
+                                .or_insert_with(HashMap::new)
+                                .insert(
+                                    name.to_owned(),
+                                    MethodSig {
+                                        path: name.to_string(),
+                                        args: MethodArgs::Tuple {
+                                            args,
+                                            self_ty: Some(ty.clone()),
+                                        },
+                                        inputs: "self".to_string(),
+                                        //TODO: add this to DERIVES if we add traits w/ more args
+                                    },
+                                );
                         }
                         break;
                     };
@@ -167,8 +327,52 @@ fn get_derives(ty: String, attrs: &[Attribute]) {
     }
 }
 
-fn create_map(items: &[MethodSig]) -> Expr {
-    let members = items.iter().map(|sig| sig.to_tuple());
+fn get_pub_constructors(i: &Item) {
+    match i {
+        Item::Struct(ItemStruct {
+            vis,
+            ident,
+            //generics,
+            fields,
+            ..
+        }) => {
+            if !is_public(vis) {
+                return;
+            }
+            let ty = ident.to_string();
+            if let Some(method_sig) = MethodSig::from_fields(ty.clone(), fields) {
+                CONTEXT.lock().unwrap().bare_fns.insert(ty, method_sig);
+            }
+        }
+        Item::Enum(ItemEnum {
+            vis,
+            ident,
+            variants,
+            ..
+        }) => {
+            if !is_public(vis) {
+                return;
+            }
+            let ty = ident.to_string();
+            for variant in variants.iter() {
+                let path: String = ty.clone() + "::" + &variant.ident.to_string();
+                if let Some(sig) = MethodSig::from_fields(path, &variant.fields) {
+                    CONTEXT
+                        .lock()
+                        .unwrap()
+                        .modules
+                        .entry(ty.clone())
+                        .or_insert_with(HashMap::new)
+                        .insert(variant.ident.to_string(), sig);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn create_map(items: &HashMap<String, MethodSig>) -> Expr {
+    let members = items.iter().map(|(name, sig)| sig.to_tuple(name));
     parse_quote! {
         ::koto_runtime::ValueMap::with_data(IntoIterator::into_iter([
             #(#members),*
@@ -179,7 +383,7 @@ fn create_map(items: &[MethodSig]) -> Expr {
     }
 }
 
-fn create_vtable(vtable: &Ident, items: &[MethodSig]) -> Item {
+fn create_vtable(vtable: &Ident, items: &HashMap<String, MethodSig>) -> Item {
     let map = create_map(items);
     parse_quote! {
         lazy_static::lazy_static! {
@@ -188,7 +392,7 @@ fn create_vtable(vtable: &Ident, items: &[MethodSig]) -> Item {
     }
 }
 
-fn create_module(prelude: &Ident, name: &str, items: &[MethodSig]) -> Stmt {
+fn create_module(prelude: &Ident, name: &str, items: &HashMap<String, MethodSig>) -> Stmt {
     let map = create_map(items);
     parse_quote! {
         #prelude.add_map(#name, #map);
@@ -198,7 +402,8 @@ fn create_module(prelude: &Ident, name: &str, items: &[MethodSig]) -> Stmt {
 //TODO: We may want to allow generics at some point, but we'd need to introduce a new type to parse them
 fn create_binding(ty_name: &str, _generics: &str, ty_vtable: &Ident) -> impl Iterator<Item = Item> {
     let ty: Ident = ident(ty_name);
-    IntoIterator::into_iter(//if generics.is_empty() {
+    IntoIterator::into_iter(
+        //if generics.is_empty() {
         [
             parse_quote! {
                 impl ::koto_runtime::ExternalValue for #ty {
@@ -230,52 +435,53 @@ fn create_binding(ty_name: &str, _generics: &str, ty_vtable: &Ident) -> impl Ite
             },
             parse_quote! {
                 impl ::lang_bindings::IntoValue for #ty {
-                    fn into_value(self) -> std::result::Result<::koto_runtime::Value, ::koto_runtime::RuntimeError> {
+                    fn into_value(self)
+                    -> std::result::Result<::koto_runtime::Value, ::koto_runtime::RuntimeError> {
                         Ok(::koto_runtime::Value::make_external_value(self, #ty_vtable.clone()))
                     }
                 }
             },
-        ]
-/*     } else {
-        let params: Punctuated<GenericParam, syn::Token![,]>::parse_terminated(generics).unwrap();
-        [
-            parse_quote! {        
-                impl<#params> ::koto_runtime::ExternalValue<#params> for #ty {
-                    fn value_type(&self) -> String {
-                        stringify!(#ty).into()
-                    }
-                }
-            },
-            parse_quote! {        
-                impl<#params> ::lang_bindings::FromValue<#params> for #ty {
-                    fn from_value(
-                        key_path: &::lang_bindings::KeyPath<'_>,
-                        value: &::koto_runtime::Value,
-                    ) -> Result<Self, ::koto_runtime::RuntimeError> {
-                        if let ::koto_runtime::Value::ExternalValue(exval, ..) = value {
-                            if let Some(v) = exval.as_ref().write().downcast_mut::<Self>() {
-                                Ok(v.clone())
-                            } else {
-                                koto_runtime::runtime_error!(
-                                    "Invalid type for external value, found '{}'",
-                                    exval.as_ref().read().value_type(),
-                                )
-                            }
-                        } else {
-                            koto_runtime::runtime_error!("Expected external value at {}", key_path)
-                        }
-                    }
-                }
-            },
-            parse_quote! {
-                impl ::lang_bindings::IntoValue for #ty {
-                    fn into_value(self) -> Value {
-                        ::koto_runtime::Value::make_external_value(self, #ty_vtable.clone())
-                    }
-                }
-            },
-        ]
-    }*/)
+        ], /*     } else {
+               let params: Punctuated<GenericParam, syn::Token![,]>::parse_terminated(generics).unwrap();
+               [
+                   parse_quote! {
+                       impl<#params> ::koto_runtime::ExternalValue<#params> for #ty {
+                           fn value_type(&self) -> String {
+                               stringify!(#ty).into()
+                           }
+                       }
+                   },
+                   parse_quote! {
+                       impl<#params> ::lang_bindings::FromValue<#params> for #ty {
+                           fn from_value(
+                               key_path: &::lang_bindings::KeyPath<'_>,
+                               value: &::koto_runtime::Value,
+                           ) -> Result<Self, ::koto_runtime::RuntimeError> {
+                               if let ::koto_runtime::Value::ExternalValue(exval, ..) = value {
+                                   if let Some(v) = exval.as_ref().write().downcast_mut::<Self>() {
+                                       Ok(v.clone())
+                                   } else {
+                                       koto_runtime::runtime_error!(
+                                           "Invalid type for external value, found '{}'",
+                                           exval.as_ref().read().value_type(),
+                                       )
+                                   }
+                               } else {
+                                   koto_runtime::runtime_error!("Expected external value at {}", key_path)
+                               }
+                           }
+                       }
+                   },
+                   parse_quote! {
+                       impl ::lang_bindings::IntoValue for #ty {
+                           fn into_value(self) -> Value {
+                               ::koto_runtime::Value::make_external_value(self, #ty_vtable.clone())
+                           }
+                       }
+                   },
+               ]
+           }*/
+    )
 }
 
 #[proc_macro]
@@ -293,7 +499,7 @@ pub fn bindlang_main(mut code: TokenStream) -> TokenStream {
         .collect::<HashMap<String, Ident>>();
     let vtable_items = vtables
         .iter()
-        .map(|(name, items)| create_vtable(&vtable_idents[name], items,));
+        .map(|(name, items)| create_vtable(&vtable_idents[name], items));
     let type_bindings = types
         .iter()
         .flat_map(|(name, generics)| create_binding(name, generics, &vtable_idents[name]));
@@ -321,26 +527,20 @@ fn vtable_ident(ty: &str) -> Ident {
 pub fn bindlang(_attrs: TokenStream, code: TokenStream) -> TokenStream {
     let code_cloned = code.clone();
     let input = parse_macro_input!(code_cloned as Item);
+    get_pub_constructors(&input);
     match &input {
         //TODO: bind trait impls
-        Item::Impl(ItemImpl {
-            attrs,
-            trait_,
-            self_ty,
-            items,
-            ..
-        }) => {
-            for item in items {
+        Item::Impl(item_impl) => {
+            for item in &item_impl.items {
                 if let ImplItem::Method(ImplItemMethod { ref sig, .. }) = item {
-                    fn_binding(sig, get_module(attrs), Some(self_ty), trait_.as_ref().map(|(_, path, _)| quote!(#path).to_string()));
+                    bind_sig(sig, get_module(&item_impl.attrs), Some(item_impl));
                 }
-                //TODO: Do we want or need to bind other items? E.g. statics?
             }
         }
         Item::Fn(ItemFn {
             ref attrs, ref sig, ..
         }) => {
-            fn_binding(sig, get_module(attrs), None, None);
+            bind_sig(sig, get_module(attrs), None);
         }
         Item::Struct(ItemStruct {
             attrs,
@@ -357,8 +557,13 @@ pub fn bindlang(_attrs: TokenStream, code: TokenStream) -> TokenStream {
             // record the type, derives and generics (as String)
             let ty_string = ty.to_string();
             get_derives(ty_string.clone(), attrs);
-            CONTEXT.lock().unwrap().types.insert(ty_string, quote!(#params).to_string());
+            CONTEXT
+                .lock()
+                .unwrap()
+                .types
+                .insert(ty_string, quote!(#params).to_string());
         }
+        //TODO: Do we want or need to bind other items? E.g. statics?
         _ => (), //TODO: Report a usable error
     }
     // we emit the code as is
