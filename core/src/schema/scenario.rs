@@ -1,16 +1,15 @@
+use crate::Content;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-use crate::Namespace;
-
 pub struct Scenario {
-    namespace: Namespace,
-    scenario: Namespace,
+    namespace: Content,
+    scenario: Content,
     name: String,
 }
 
 impl Scenario {
-    pub fn new(namespace: Namespace, namespace_path: PathBuf, scenario: &str) -> Result<Self> {
+    pub fn new(namespace: Content, namespace_path: PathBuf, scenario: &str) -> Result<Self> {
         let scenario_path = namespace_path
             .join("scenarios")
             .join(scenario)
@@ -37,7 +36,7 @@ impl Scenario {
         })
     }
 
-    pub fn build(mut self) -> Result<Namespace> {
+    pub fn build(mut self) -> Result<Content> {
         self.has_extra_collections()
             .context(anyhow!("failed to build scenario '{}'", self.name))?;
         self.trim_namespace_collections();
@@ -46,10 +45,12 @@ impl Scenario {
     }
 
     fn has_extra_collections(&self) -> Result<()> {
-        let collections: Vec<_> = self.namespace.keys().collect();
+        let collections: Vec<_> = self.namespace.as_object_content().fields.keys().collect();
 
         let extra_collections: Vec<_> = self
             .scenario
+            .as_object_content()
+            .fields
             .keys()
             .filter(|c| !collections.contains(c))
             .collect();
@@ -71,19 +72,22 @@ impl Scenario {
     }
 
     fn trim_namespace_collections(&mut self) {
-        let scenario_collections: Vec<_> = self.scenario.keys().collect();
+        let scenario_collections: Vec<_> =
+            self.scenario.as_object_content().fields.keys().collect();
 
         let trim_collections: Vec<_> = self
             .namespace
+            .as_object_content()
+            .fields
             .keys()
             .map(ToOwned::to_owned)
             .into_iter()
-            .filter(|c| !scenario_collections.contains(&c.as_str()))
+            .filter(|c| !scenario_collections.contains(&c))
             .collect();
 
         for trim_collection in trim_collections {
             debug!("removing collection '{}'", trim_collection);
-            self.namespace.remove_collection(&trim_collection);
+            self.namespace.remove_collection(&trim_collection).unwrap();
         }
     }
 }
@@ -105,7 +109,7 @@ mod tests {
         {
             $($inner:tt)*
         } => {
-            serde_json::from_value::<crate::Namespace>(serde_json::json!($($inner)*))
+            serde_json::from_value::<crate::Content>(serde_json::json!($($inner)*))
                 .expect("could not deserialize scenario into a namespace")
         }
     }

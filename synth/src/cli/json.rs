@@ -3,7 +3,7 @@ use crate::cli::import::ImportStrategy;
 use crate::sampler::SamplerOutput;
 
 use synth_core::schema::{MergeStrategy, OptionalMergeStrategy};
-use synth_core::{Content, Namespace};
+use synth_core::Content;
 
 use anyhow::{Context, Result};
 
@@ -17,7 +17,7 @@ pub struct JsonFileExportStrategy {
 }
 
 impl ExportStrategy for JsonFileExportStrategy {
-    fn export(&self, _namespace: Namespace, sample: SamplerOutput) -> Result<()> {
+    fn export(&self, _namespace: Content, sample: SamplerOutput) -> Result<()> {
         std::fs::write(&self.from_file, sample.into_json().to_string())?;
 
         Ok(())
@@ -30,7 +30,7 @@ pub struct JsonStdoutExportStrategy<W> {
 }
 
 impl<W: Write> ExportStrategy for JsonStdoutExportStrategy<W> {
-    fn export(&self, _namespace: Namespace, sample: SamplerOutput) -> Result<()> {
+    fn export(&self, _namespace: Content, sample: SamplerOutput) -> Result<()> {
         writeln!(self.writer.borrow_mut(), "{}", sample.into_json())
             .expect("failed to write json output");
 
@@ -44,7 +44,7 @@ pub struct JsonFileImportStrategy {
 }
 
 impl ImportStrategy for JsonFileImportStrategy {
-    fn import(&self) -> Result<Namespace> {
+    fn import_namespace(&self) -> Result<Content> {
         import_json(serde_json::from_reader(std::fs::File::open(
             &self.from_file,
         )?)?)
@@ -55,12 +55,12 @@ impl ImportStrategy for JsonFileImportStrategy {
 pub struct JsonStdinImportStrategy;
 
 impl ImportStrategy for JsonStdinImportStrategy {
-    fn import(&self) -> Result<Namespace> {
+    fn import_namespace(&self) -> Result<Content> {
         import_json(serde_json::from_reader(std::io::stdin())?)
     }
 }
 
-pub fn import_json(val: serde_json::Value) -> Result<Namespace> {
+pub fn import_json(val: serde_json::Value) -> Result<Content> {
     match val {
         serde_json::Value::Object(object) => object
             .into_iter()
@@ -81,7 +81,7 @@ fn collection_from_value(value: &serde_json::Value) -> Result<Content> {
     match value {
         serde_json::Value::Array(values) => {
             let fst = values.first().unwrap_or(&serde_json::Value::Null);
-            let mut as_content = Content::from_value_wrapped_in_array(fst);
+            let mut as_content = Content::new_collection(fst.into());
             OptionalMergeStrategy.try_merge(&mut as_content, value)?;
             Ok(as_content)
         }

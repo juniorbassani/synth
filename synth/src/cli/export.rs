@@ -15,12 +15,12 @@ use std::path::PathBuf;
 use crate::datasource::DataSource;
 use crate::sampler::SamplerOutput;
 use async_std::task;
-use synth_core::{DataSourceParams, Namespace, Value};
+use synth_core::{Content, DataSourceParams, Value};
 
 use super::map_from_uri_query;
 
 pub(crate) trait ExportStrategy {
-    fn export(&self, namespace: Namespace, sample: SamplerOutput) -> Result<()>;
+    fn export(&self, namespace: Content, sample: SamplerOutput) -> Result<()>;
 }
 
 pub(crate) struct ExportStrategyBuilder<'a, W> {

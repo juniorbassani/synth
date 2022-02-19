@@ -21,8 +21,8 @@ use crate::utils::META_OS;
 use crate::version::version;
 
 use synth_core::{
-    compile::{Address, CompilerState, FromLink, Source},
-    Compile, Compiler, Content, Graph, Namespace,
+    compile::{Address, CompilerState, FromLink},
+    Compile, Compiler, Content, Graph,
 };
 
 use super::{Args, TelemetryCommand};
@@ -173,10 +173,7 @@ impl<'t, 'a: 't> TelemetryCrawler<'t, 'a> {
     }
 
     fn compile(self) -> Result<()> {
-        match self.state.source() {
-            Source::Namespace(namespace) => namespace.compile(self)?,
-            Source::Content(content) => content.compile(self)?,
-        };
+        self.state.source().compile(self)?;
         Ok(())
     }
 }
@@ -227,12 +224,12 @@ impl<'w> TelemetryExportStrategy<'w> {
 
     pub(super) fn fill_telemetry(
         context: Rc<RefCell<TelemetryContext>>,
-        namespace: &Namespace,
+        namespace: &Content,
         collection: Option<String>,
         ns_path: PathBuf,
     ) -> Result<()> {
         let crawler = TelemetryCrawler {
-            state: &mut CompilerState::namespace(namespace),
+            state: &mut CompilerState::new(namespace),
             position: Address::new_root(),
             context: Rc::clone(&context),
         };
@@ -249,7 +246,7 @@ impl<'w> TelemetryExportStrategy<'w> {
             }
         } else {
             namespace.compile(crawler)?;
-            let num_col = namespace.len();
+            let num_col = namespace.count_collections()?;
             context.borrow_mut().num_collections = Some(num_col);
 
             // Namespace, length and content for each collection
@@ -282,7 +279,7 @@ impl<'w> TelemetryExportStrategy<'w> {
 }
 
 impl<'w> ExportStrategy for TelemetryExportStrategy<'w> {
-    fn export(&self, namespace: Namespace, sample: SamplerOutput) -> Result<()> {
+    fn export(&self, namespace: Content, sample: SamplerOutput) -> Result<()> {
         Self::fill_telemetry(
             Rc::clone(&self.telemetry_context),
             &namespace,
@@ -527,8 +524,7 @@ impl TelemetryClient {
 #[cfg(test)]
 pub mod tests {
     use super::{
-        ExportStrategy, Namespace, SamplerOutput, TelemetryClient, TelemetryContext,
-        TelemetryExportStrategy,
+        ExportStrategy, SamplerOutput, TelemetryClient, TelemetryContext, TelemetryExportStrategy,
     };
     use crate::sampler::Sampler;
     use anyhow::Result;
@@ -536,6 +532,7 @@ pub mod tests {
     use std::convert::TryFrom;
     use std::path::PathBuf;
     use std::rc::Rc;
+    use synth_core::Content;
 
     macro_rules! schema {
         {
@@ -549,14 +546,14 @@ pub mod tests {
     pub struct DummyExportStrategy {}
 
     impl ExportStrategy for DummyExportStrategy {
-        fn export(&self, _namespace: Namespace, _sample: SamplerOutput) -> Result<()> {
+        fn export(&self, _namespace: Content, _sample: SamplerOutput) -> Result<()> {
             Ok(())
         }
     }
 
     #[test]
     fn telemetry_export_strategy() {
-        let mut schema: Namespace = schema!({
+        let mut schema = schema!({
             "type": "object",
             "strings": {
                 "type": "array",
@@ -594,9 +591,7 @@ pub mod tests {
                     }
                 }
             }
-        })
-        .into_namespace()
-        .unwrap();
+        });
 
         let context = Rc::new(RefCell::new(TelemetryContext::new()));
         let export_strategy = TelemetryExportStrategy::new(
@@ -630,8 +625,8 @@ pub mod tests {
                 ),
                 num_collections: Some(2),
                 num_fields: Some(4),
-                namespace_name_sha: Some(15302706232490290083),
-                namespace_sha: Some(10334654735128021143),
+                namespace_name_sha: Some(15958021001824619157),
+                namespace_sha: Some(10572529758725673244),
                 bytes: Some(138),
             },
             "string fakers should be correct"
@@ -688,9 +683,7 @@ pub mod tests {
                     }
                 }
             }
-        })
-        .into_namespace()
-        .unwrap();
+        });
 
         let sample = Sampler::try_from(&schema)
             .unwrap()
@@ -715,8 +708,8 @@ pub mod tests {
                 ),
                 num_collections: Some(1),
                 num_fields: Some(6),
-                namespace_name_sha: Some(15302706232490290083),
-                namespace_sha: Some(7413555395156765757),
+                namespace_name_sha: Some(15958021001824619157),
+                namespace_sha: Some(5425759925702296223),
                 bytes: Some(140),
             },
             "int ranges should be correct"
@@ -762,9 +755,7 @@ pub mod tests {
                     }
                 }
             }
-        })
-        .into_namespace()
-        .unwrap();
+        });
 
         let sample = Sampler::try_from(&schema)
             .unwrap()
@@ -788,8 +779,8 @@ pub mod tests {
                 ),
                 num_collections: Some(1),
                 num_fields: Some(5),
-                namespace_name_sha: Some(15302706232490290083),
-                namespace_sha: Some(1231538834371280080),
+                namespace_name_sha: Some(15958021001824619157),
+                namespace_sha: Some(11932649130297002998),
                 bytes: Some(151),
             },
             "other generators should be correct"
@@ -836,9 +827,7 @@ pub mod tests {
                     }
                 }
             }
-        })
-        .into_namespace()
-        .unwrap();
+        });
 
         let sample = Sampler::try_from(&schema)
             .unwrap()
@@ -857,8 +846,8 @@ pub mod tests {
                 ),
                 num_collections: Some(1),
                 num_fields: Some(1),
-                namespace_name_sha: Some(6868949361385231259),
-                namespace_sha: Some(5224534078999940403),
+                namespace_name_sha: Some(15942663951453216254),
+                namespace_sha: Some(13157132388508458458),
                 bytes: Some(27),
             },
             "should only have stats for collection 2"
